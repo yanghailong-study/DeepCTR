@@ -10,7 +10,8 @@ Reference:
 
     [2] Wang R, Shivanna R, Cheng D Z, et al. DCN-M: Improved Deep & Cross Network for Feature Cross Learning in Web-scale Learning to Rank Systems[J]. 2020. (https://arxiv.org/abs/2008.13535)
 """
-import tensorflow as tf
+from tensorflow.python.keras.models import Model
+from tensorflow.python.keras.layers import Dense, Concatenate
 
 from ..feature_column import build_input_features, get_linear_logit, input_from_feature_columns
 from ..layers.core import PredictionLayer, DNN
@@ -19,7 +20,7 @@ from ..layers.utils import add_func, combined_dnn_input
 
 
 def DCN(linear_feature_columns, dnn_feature_columns, cross_num=2, cross_parameterization='vector',
-        dnn_hidden_units=(128, 128,), l2_reg_linear=1e-5, l2_reg_embedding=1e-5,
+        dnn_hidden_units=(256, 128, 64), l2_reg_linear=1e-5, l2_reg_embedding=1e-5,
         l2_reg_cross=1e-5, l2_reg_dnn=0, seed=1024, dnn_dropout=0, dnn_use_bn=False,
         dnn_activation='relu', task='binary'):
     """Instantiates the Deep&Cross Network architecture.
@@ -58,23 +59,20 @@ def DCN(linear_feature_columns, dnn_feature_columns, cross_num=2, cross_paramete
     if len(dnn_hidden_units) > 0 and cross_num > 0:  # Deep & Cross
         deep_out = DNN(dnn_hidden_units, dnn_activation, l2_reg_dnn, dnn_dropout, dnn_use_bn, seed=seed)(dnn_input)
         cross_out = CrossNet(cross_num, parameterization=cross_parameterization, l2_reg=l2_reg_cross)(dnn_input)
-        stack_out = tf.keras.layers.Concatenate()([cross_out, deep_out])
-        final_logit = tf.keras.layers.Dense(
-            1, use_bias=False, kernel_initializer=tf.keras.initializers.glorot_normal(seed))(stack_out)
+        stack_out = Concatenate()([cross_out, deep_out])
+        final_logit = Dense(1, use_bias=False)(stack_out)
     elif len(dnn_hidden_units) > 0:  # Only Deep
         deep_out = DNN(dnn_hidden_units, dnn_activation, l2_reg_dnn, dnn_dropout, dnn_use_bn, seed=seed)(dnn_input)
-        final_logit = tf.keras.layers.Dense(
-            1, use_bias=False, kernel_initializer=tf.keras.initializers.glorot_normal(seed))(deep_out)
+        final_logit = Dense(1, use_bias=False)(deep_out)
     elif cross_num > 0:  # Only Cross
         cross_out = CrossNet(cross_num, parameterization=cross_parameterization, l2_reg=l2_reg_cross)(dnn_input)
-        final_logit = tf.keras.layers.Dense(
-            1, use_bias=False, kernel_initializer=tf.keras.initializers.glorot_normal(seed))(cross_out)
+        final_logit = Dense(1, use_bias=False)(cross_out)
     else:  # Error
         raise NotImplementedError
 
     final_logit = add_func([final_logit, linear_logit])
     output = PredictionLayer(task)(final_logit)
 
-    model = tf.keras.models.Model(inputs=inputs_list, outputs=output)
+    model = Model(inputs=inputs_list, outputs=output)
 
     return model

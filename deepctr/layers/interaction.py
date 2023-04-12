@@ -3,7 +3,8 @@
 
 Authors:
     Weichen Shen,weichenswc@163.com,
-    Harshit Pande
+    Harshit Pande,
+    Yi He, heyi_jack@163.com
 
 """
 
@@ -12,14 +13,21 @@ import itertools
 import tensorflow as tf
 from tensorflow.python.keras import backend as K
 from tensorflow.python.keras.backend import batch_dot
-from tensorflow.python.keras.initializers import (Zeros, glorot_normal,
-                                                  glorot_uniform, TruncatedNormal)
-from tensorflow.python.keras.layers import Layer
+
+try:
+    from tensorflow.python.ops.init_ops import Zeros, Ones, Constant, TruncatedNormal, \
+        glorot_normal_initializer as glorot_normal, \
+        glorot_uniform_initializer as glorot_uniform
+except ImportError:
+    from tensorflow.python.ops.init_ops_v2 import Zeros, Ones, Constant, TruncatedNormal, glorot_normal, glorot_uniform
+
+from tensorflow.python.keras.layers import Layer, MaxPooling2D, Conv2D, Dropout, Lambda, Dense, Flatten
 from tensorflow.python.keras.regularizers import l2
 from tensorflow.python.layers import utils
 
 from .activation import activation_layer
 from .utils import concat_func, reduce_sum, softmax, reduce_mean
+from .core import DNN
 
 
 class AFMLayer(Layer):
@@ -90,10 +98,10 @@ class AFMLayer(Layer):
                                             initializer=glorot_normal(seed=self.seed), name="projection_h")
         self.projection_p = self.add_weight(shape=(
             embedding_size, 1), initializer=glorot_normal(seed=self.seed), name="projection_p")
-        self.dropout = tf.keras.layers.Dropout(
+        self.dropout = Dropout(
             self.dropout_rate, seed=self.seed)
 
-        self.tensordot = tf.keras.layers.Lambda(
+        self.tensordot = Lambda(
             lambda x: tf.tensordot(x[0], x[1], axes=(-1, 0)))
 
         # Be sure to call this somewhere!
@@ -244,7 +252,7 @@ class CIN(Layer):
                                                 regularizer=l2(self.l2_reg)))
 
             self.bias.append(self.add_weight(name='bias' + str(i), shape=[size], dtype=tf.float32,
-                                             initializer=tf.keras.initializers.Zeros()))
+                                             initializer=Zeros()))
 
             if self.split_half:
                 if i != len(self.layer_size) - 1 and size % 2 > 0:
@@ -485,7 +493,7 @@ class CrossNetMix(Layer):
                                        regularizer=l2(self.l2_reg),
                                        trainable=True) for i in range(self.layer_num)]
 
-        self.gating = [tf.keras.layers.Dense(1, use_bias=False) for i in range(self.num_experts)]
+        self.gating = [Dense(1, use_bias=False) for i in range(self.num_experts)]
 
         self.bias = [self.add_weight(name='bias' + str(i),
                                      shape=(dim, 1),
@@ -700,13 +708,14 @@ class InteractingLayer(Layer):
             - [Song W, Shi C, Xiao Z, et al. AutoInt: Automatic Feature Interaction Learning via Self-Attentive Neural Networks[J]. arXiv preprint arXiv:1810.11921, 2018.](https://arxiv.org/abs/1810.11921)
     """
 
-    def __init__(self, att_embedding_size=8, head_num=2, use_res=True, seed=1024, **kwargs):
+    def __init__(self, att_embedding_size=8, head_num=2, use_res=True, scaling=False, seed=1024, **kwargs):
         if head_num <= 0:
             raise ValueError('head_num must be a int > 0')
         self.att_embedding_size = att_embedding_size
         self.head_num = head_num
         self.use_res = use_res
         self.seed = seed
+        self.scaling = scaling
         super(InteractingLayer, self).__init__(**kwargs)
 
     def build(self, input_shape):
@@ -716,17 +725,17 @@ class InteractingLayer(Layer):
         embedding_size = int(input_shape[-1])
         self.W_Query = self.add_weight(name='query', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                        dtype=tf.float32,
-                                       initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed))
+                                       initializer=TruncatedNormal(seed=self.seed))
         self.W_key = self.add_weight(name='key', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                      dtype=tf.float32,
-                                     initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed + 1))
+                                     initializer=TruncatedNormal(seed=self.seed + 1))
         self.W_Value = self.add_weight(name='value', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                        dtype=tf.float32,
-                                       initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed + 2))
+                                       initializer=TruncatedNormal(seed=self.seed + 2))
         if self.use_res:
             self.W_Res = self.add_weight(name='res', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                          dtype=tf.float32,
-                                         initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed))
+                                         initializer=TruncatedNormal(seed=self.seed))
 
         # Be sure to call this somewhere!
         super(InteractingLayer, self).build(input_shape)
@@ -748,6 +757,8 @@ class InteractingLayer(Layer):
 
         inner_product = tf.matmul(
             querys, keys, transpose_b=True)  # head_num None F F
+        if self.scaling:
+            inner_product /= self.att_embedding_size ** 0.5
         self.normalized_att_scores = softmax(inner_product)
 
         result = tf.matmul(self.normalized_att_scores,
@@ -961,15 +972,15 @@ class FGCNNLayer(Layer):
                 pooling_shape, (width, 1))
             pooling_shape = self._pooling_output_shape(
                 conv_output_shape, (pooling_width, 1))
-            self.conv_layers.append(tf.keras.layers.Conv2D(filters=filters, kernel_size=(width, 1), strides=(1, 1),
-                                                           padding='same',
-                                                           activation='tanh', use_bias=True, ))
+            self.conv_layers.append(Conv2D(filters=filters, kernel_size=(width, 1), strides=(1, 1),
+                                           padding='same',
+                                           activation='tanh', use_bias=True, ))
             self.pooling_layers.append(
-                tf.keras.layers.MaxPooling2D(pool_size=(pooling_width, 1)))
-            self.dense_layers.append(tf.keras.layers.Dense(pooling_shape[1] * embedding_size * new_filters,
-                                                           activation='tanh', use_bias=True))
+                MaxPooling2D(pool_size=(pooling_width, 1)))
+            self.dense_layers.append(Dense(pooling_shape[1] * embedding_size * new_filters,
+                                           activation='tanh', use_bias=True))
 
-        self.flatten = tf.keras.layers.Flatten()
+        self.flatten = Flatten()
 
         super(FGCNNLayer, self).build(
             input_shape)  # Be sure to call this somewhere!
@@ -1087,7 +1098,7 @@ class SENETLayer(Layer):
         self.W_2 = self.add_weight(shape=(
             reduction_size, self.filed_size), initializer=glorot_normal(seed=self.seed), name="W_2")
 
-        self.tensordot = tf.keras.layers.Lambda(
+        self.tensordot = Lambda(
             lambda x: tf.tensordot(x[0], x[1], axes=(-1, 0)))
 
         # Be sure to call this somewhere!
@@ -1242,14 +1253,14 @@ class FieldWiseBiInteraction(Layer):
         self.kernel_mf = self.add_weight(
             name='kernel_mf',
             shape=(int(self.num_fields * (self.num_fields - 1) / 2), 1),
-            initializer=tf.keras.initializers.Ones(),
+            initializer=Ones(),
             regularizer=None,
             trainable=True)
 
         self.kernel_fm = self.add_weight(
             name='kernel_fm',
             shape=(self.num_fields, 1),
-            initializer=tf.keras.initializers.Constant(value=0.5),
+            initializer=Constant(value=0.5),
             regularizer=None,
             trainable=True)
         if self.use_bias:
@@ -1405,4 +1416,144 @@ class FwFMLayer(Layer):
             'num_fields': self.num_fields,
             'regularizer': self.regularizer
         })
+        return config
+
+
+class FEFMLayer(Layer):
+    """Field-Embedded Factorization Machines
+
+      Input shape
+        - 3D tensor with shape: ``(batch_size,field_size,embedding_size)``.
+
+      Output shape
+        - 2D tensor with shape:
+            ``(batch_size, (num_fields * (num_fields-1))/2)`` # concatenated FEFM interaction embeddings
+
+      Arguments
+        - **regularizer** : L2 regularizer weight for the field pair matrix embeddings parameters of FEFM
+
+      References
+        - [Field-Embedded Factorization Machines for Click-through Rate Prediction]
+         https://arxiv.org/pdf/2009.09931.pdf
+    """
+
+    def __init__(self, regularizer, **kwargs):
+        self.regularizer = regularizer
+        super(FEFMLayer, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        if len(input_shape) != 3:
+            raise ValueError("Unexpected inputs dimensions % d,\
+                                expect to be 3 dimensions" % (len(input_shape)))
+
+        self.num_fields = int(input_shape[1])
+        embedding_size = int(input_shape[2])
+
+        self.field_embeddings = {}
+        for fi, fj in itertools.combinations(range(self.num_fields), 2):
+            field_pair_id = str(fi) + "-" + str(fj)
+            self.field_embeddings[field_pair_id] = self.add_weight(name='field_embeddings' + field_pair_id,
+                                                                   shape=(embedding_size, embedding_size),
+                                                                   initializer=TruncatedNormal(),
+                                                                   regularizer=l2(self.regularizer),
+                                                                   trainable=True)
+
+        super(FEFMLayer, self).build(input_shape)  # Be sure to call this somewhere!
+
+    def call(self, inputs, **kwargs):
+        if K.ndim(inputs) != 3:
+            raise ValueError(
+                "Unexpected inputs dimensions %d, expect to be 3 dimensions"
+                % (K.ndim(inputs)))
+
+        pairwise_inner_prods = []
+        for fi, fj in itertools.combinations(range(self.num_fields), 2):
+            field_pair_id = str(fi) + "-" + str(fj)
+            feat_embed_i = tf.squeeze(inputs[0:, fi:fi + 1, 0:], axis=1)
+            feat_embed_j = tf.squeeze(inputs[0:, fj:fj + 1, 0:], axis=1)
+            field_pair_embed_ij = self.field_embeddings[field_pair_id]
+
+            feat_embed_i_tr = tf.matmul(feat_embed_i, field_pair_embed_ij + tf.transpose(field_pair_embed_ij))
+
+            f = batch_dot(feat_embed_i_tr, feat_embed_j, axes=1)
+            pairwise_inner_prods.append(f)
+
+        concat_vec = tf.concat(pairwise_inner_prods, axis=1)
+        return concat_vec
+
+    def compute_output_shape(self, input_shape):
+        num_fields = int(input_shape[1])
+        return (None, (num_fields * (num_fields - 1)) / 2)
+
+    def get_config(self):
+        config = super(FEFMLayer, self).get_config().copy()
+        config.update({
+            'regularizer': self.regularizer,
+        })
+        return config
+
+
+class BridgeModule(Layer):
+    """Bridge Module used in EDCN
+
+      Input shape
+        - A list of two 2D tensor with shape: ``(batch_size, units)``.
+
+      Output shape
+        - 2D tensor with shape: ``(batch_size, units)``.
+
+    Arguments
+        - **bridge_type**: The type of bridge interaction, one of 'pointwise_addition', 'hadamard_product', 'concatenation', 'attention_pooling'
+
+        - **activation**: Activation function to use.
+
+      References
+        - [Enhancing Explicit and Implicit Feature Interactions via Information Sharing for Parallel Deep CTR Models.](https://dlp-kdd.github.io/assets/pdf/DLP-KDD_2021_paper_12.pdf)
+
+    """
+
+    def __init__(self, bridge_type='hadamard_product', activation='relu', **kwargs):
+        self.bridge_type = bridge_type
+        self.activation = activation
+
+        super(BridgeModule, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        if not isinstance(input_shape, list) or len(input_shape) < 2:
+            raise ValueError(
+                'A `BridgeModule` layer should be called '
+                'on a list of 2 inputs')
+
+        self.dnn_dim = int(input_shape[0][-1])
+        if self.bridge_type == "concatenation":
+            self.dense = Dense(self.dnn_dim, self.activation)
+        elif self.bridge_type == "attention_pooling":
+            self.dense_x = DNN([self.dnn_dim, self.dnn_dim], self.activation, output_activation='softmax')
+            self.dense_h = DNN([self.dnn_dim, self.dnn_dim], self.activation, output_activation='softmax')
+
+        super(BridgeModule, self).build(input_shape)  # Be sure to call this somewhere!
+
+    def call(self, inputs, **kwargs):
+        x, h = inputs
+        if self.bridge_type == "pointwise_addition":
+            return x + h
+        elif self.bridge_type == "hadamard_product":
+            return x * h
+        elif self.bridge_type == "concatenation":
+            return self.dense(tf.concat([x, h], axis=-1))
+        elif self.bridge_type == "attention_pooling":
+            a_x = self.dense_x(x)
+            a_h = self.dense_h(h)
+            return a_x * x + a_h * h
+
+    def compute_output_shape(self, input_shape):
+        return (None, self.dnn_dim)
+
+    def get_config(self):
+        base_config = super(BridgeModule, self).get_config().copy()
+        config = {
+            'bridge_type': self.bridge_type,
+            'activation': self.activation
+        }
+        config.update(base_config)
         return config

@@ -9,8 +9,13 @@ Author:
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.initializers import TruncatedNormal
-from tensorflow.python.keras.layers import LSTM, Lambda, Layer
+
+try:
+    from tensorflow.python.ops.init_ops import TruncatedNormal, Constant, glorot_uniform_initializer as glorot_uniform
+except ImportError:
+    from tensorflow.python.ops.init_ops_v2 import TruncatedNormal, Constant, glorot_uniform
+
+from tensorflow.python.keras.layers import LSTM, Lambda, Layer, Dropout
 
 from .core import LocalActivationUnit
 from .normalization import LayerNormalization
@@ -381,7 +386,7 @@ class BiLSTM(Layer):
         elif self.merge_mode == "bw":
             output = output_bw
         elif self.merge_mode == 'concat':
-            output = K.concatenate([output_fw, output_bw])
+            output = tf.concat([output_fw, output_bw], axis=-1)
         elif self.merge_mode == 'sum':
             output = output_fw + output_bw
         elif self.merge_mode == 'ave':
@@ -436,7 +441,7 @@ class Transformer(Layer):
             - **blinding**: bool. Whether or not use blinding.
             - **seed**: A Python integer to use as random seed.
             - **supports_masking**:bool. Whether or not support masking.
-            - **attention_type**: str, Type of attention, the value must be one of { ``'scaled_dot_product'`` , ``'additive'`` }.
+            - **attention_type**: str, Type of attention, the value must be one of { ``'scaled_dot_product'`` , ``'cos'`` , ``'ln'`` , ``'additive'`` }.
             - **output_type**: ``'mean'`` , ``'sum'`` or `None`. Whether or not use average/sum pooling for output.
 
       References
@@ -472,34 +477,36 @@ class Transformer(Layer):
         self.seq_len_max = int(input_shape[0][-2])
         self.W_Query = self.add_weight(name='query', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                        dtype=tf.float32,
-                                       initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed))
+                                       initializer=TruncatedNormal(seed=self.seed))
         self.W_key = self.add_weight(name='key', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                      dtype=tf.float32,
-                                     initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed + 1))
+                                     initializer=TruncatedNormal(seed=self.seed + 1))
         self.W_Value = self.add_weight(name='value', shape=[embedding_size, self.att_embedding_size * self.head_num],
                                        dtype=tf.float32,
-                                       initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed + 2))
+                                       initializer=TruncatedNormal(seed=self.seed + 2))
         if self.attention_type == "additive":
             self.b = self.add_weight('b', shape=[self.att_embedding_size], dtype=tf.float32,
-                                     initializer=tf.keras.initializers.glorot_uniform(seed=self.seed))
+                                     initializer=glorot_uniform(seed=self.seed))
             self.v = self.add_weight('v', shape=[self.att_embedding_size], dtype=tf.float32,
-                                     initializer=tf.keras.initializers.glorot_uniform(seed=self.seed))
+                                     initializer=glorot_uniform(seed=self.seed))
+        elif self.attention_type == "ln":
+            self.att_ln_q = LayerNormalization()
+            self.att_ln_k = LayerNormalization()
         # if self.use_res:
         #     self.W_Res = self.add_weight(name='res', shape=[embedding_size, self.att_embedding_size * self.head_num], dtype=tf.float32,
-        #                                  initializer=tf.keras.initializers.TruncatedNormal(seed=self.seed))
+        #                                  initializer=TruncatedNormal(seed=self.seed))
         if self.use_feed_forward:
             self.fw1 = self.add_weight('fw1', shape=[self.num_units, 4 * self.num_units], dtype=tf.float32,
-                                       initializer=tf.keras.initializers.glorot_uniform(seed=self.seed))
+                                       initializer=glorot_uniform(seed=self.seed))
             self.fw2 = self.add_weight('fw2', shape=[4 * self.num_units, self.num_units], dtype=tf.float32,
-                                       initializer=tf.keras.initializers.glorot_uniform(seed=self.seed))
+                                       initializer=glorot_uniform(seed=self.seed))
 
-        # if self.use_positional_encoding:
-        #
-        #     self.kpe = Position_Embedding(input_shape[0][-1].value)
-        #     self.qpe = Position_Embedding(input_shape[1][-1].value)
-        self.dropout = tf.keras.layers.Dropout(
+        self.dropout = Dropout(
             self.dropout_rate, seed=self.seed)
         self.ln = LayerNormalization()
+        if self.use_positional_encoding:
+            self.query_pe = PositionEncoding()
+            self.key_pe = PositionEncoding()
         # Be sure to call this somewhere!
         super(Transformer, self).build(input_shape)
 
@@ -521,31 +528,45 @@ class Transformer(Layer):
             key_masks = tf.squeeze(key_masks, axis=1)
 
         if self.use_positional_encoding:
-            queries = positional_encoding(queries)
-            keys = positional_encoding(queries)
+            queries = self.query_pe(queries)
+            keys = self.key_pe(keys)
 
-        querys = tf.tensordot(queries, self.W_Query,
-                              axes=(-1, 0))  # None T_q D*head_num
-        keys = tf.tensordot(keys, self.W_key, axes=(-1, 0))
-        values = tf.tensordot(keys, self.W_Value, axes=(-1, 0))
+        Q = tf.tensordot(queries, self.W_Query,
+                         axes=(-1, 0))  # N T_q D*h
+        K = tf.tensordot(keys, self.W_key, axes=(-1, 0))
+        V = tf.tensordot(keys, self.W_Value, axes=(-1, 0))
 
-        # head_num*None T_q D
-        querys = tf.concat(tf.split(querys, self.head_num, axis=2), axis=0)
-        keys = tf.concat(tf.split(keys, self.head_num, axis=2), axis=0)
-        values = tf.concat(tf.split(values, self.head_num, axis=2), axis=0)
+        # h*N T_q D
+        Q_ = tf.concat(tf.split(Q, self.head_num, axis=2), axis=0)
+        K_ = tf.concat(tf.split(K, self.head_num, axis=2), axis=0)
+        V_ = tf.concat(tf.split(V, self.head_num, axis=2), axis=0)
 
         if self.attention_type == "scaled_dot_product":
-            # head_num*None T_q T_k
-            outputs = tf.matmul(querys, keys, transpose_b=True)
+            # h*N T_q T_k
+            outputs = tf.matmul(Q_, K_, transpose_b=True)
 
-            outputs = outputs / (keys.get_shape().as_list()[-1] ** 0.5)
+            outputs = outputs / (K_.get_shape().as_list()[-1] ** 0.5)
+        elif self.attention_type == "cos":
+            Q_cos = tf.nn.l2_normalize(Q_, dim=-1)
+            K_cos = tf.nn.l2_normalize(K_, dim=-1)
+
+            outputs = tf.matmul(Q_cos, K_cos, transpose_b=True)  # h*N T_q T_k
+
+            outputs = outputs * 20  # Scale
+        elif self.attention_type == 'ln':
+            Q_ = self.att_ln_q(Q_)
+            K_ = self.att_ln_k(K_)
+
+            outputs = tf.matmul(Q_, K_, transpose_b=True)  # h*N T_q T_k
+            # Scale
+            outputs = outputs / (K_.get_shape().as_list()[-1] ** 0.5)
         elif self.attention_type == "additive":
-            querys_reshaped = tf.expand_dims(querys, axis=-2)
-            keys_reshaped = tf.expand_dims(keys, axis=-3)
-            outputs = tf.tanh(tf.nn.bias_add(querys_reshaped + keys_reshaped, self.b))
+            Q_reshaped = tf.expand_dims(Q_, axis=-2)
+            K_reshaped = tf.expand_dims(K_, axis=-3)
+            outputs = tf.tanh(tf.nn.bias_add(Q_reshaped + K_reshaped, self.b))
             outputs = tf.squeeze(tf.tensordot(outputs, tf.expand_dims(self.v, axis=-1), axes=[-1, 0]), axis=-1)
         else:
-            NotImplementedError
+            raise ValueError("attention_type must be [scaled_dot_product,cos,ln,additive]")
 
         key_masks = tf.tile(key_masks, [self.head_num, 1])
 
@@ -562,7 +583,7 @@ class Transformer(Layer):
             try:
                 outputs = tf.matrix_set_diag(outputs, tf.ones_like(outputs)[
                                                       :, :, 0] * (-2 ** 32 + 1))
-            except:
+            except AttributeError:
                 outputs = tf.compat.v1.matrix_set_diag(outputs, tf.ones_like(outputs)[
                                                                 :, :, 0] * (-2 ** 32 + 1))
 
@@ -578,7 +599,7 @@ class Transformer(Layer):
         outputs = self.dropout(outputs, training=training)
         # Weighted sum
         # ( h*N, T_q, C/h)
-        result = tf.matmul(outputs, values)
+        result = tf.matmul(outputs, V_)
         result = tf.concat(tf.split(result, self.head_num, axis=0), axis=2)
 
         if self.use_res:
@@ -620,54 +641,56 @@ class Transformer(Layer):
         return dict(list(base_config.items()) + list(config.items()))
 
 
-def positional_encoding(inputs,
-                        pos_embedding_trainable=True,
-                        zero_pad=False,
-                        scale=True,
-                        ):
-    '''Sinusoidal Positional_Encoding.
+class PositionEncoding(Layer):
+    def __init__(self, pos_embedding_trainable=True,
+                 zero_pad=False,
+                 scale=True, **kwargs):
+        self.pos_embedding_trainable = pos_embedding_trainable
+        self.zero_pad = zero_pad
+        self.scale = scale
+        super(PositionEncoding, self).__init__(**kwargs)
 
-    Args:
+    def build(self, input_shape):
+        # Create a trainable weight variable for this layer.
+        _, T, num_units = input_shape.as_list()  # inputs.get_shape().as_list()
+        # First part of the PE function: sin and cos argument
+        position_enc = np.array([
+            [pos / np.power(10000, 2. * (i // 2) / num_units) for i in range(num_units)]
+            for pos in range(T)])
 
-      - inputs: A 2d Tensor with shape of (N, T).
-      - num_units: Output dimensionality
-      - zero_pad: Boolean. If True, all the values of the first row (id = 0) should be constant zero
-      - scale: Boolean. If True, the output will be multiplied by sqrt num_units(check details from paper)
-      - scope: Optional scope for `variable_scope`.
-      - reuse: Boolean, whether to reuse the weights of a previous layer by the same name.
+        # Second part, apply the cosine to even columns and sin to odds.
+        position_enc[:, 0::2] = np.sin(position_enc[:, 0::2])  # dim 2i
+        position_enc[:, 1::2] = np.cos(position_enc[:, 1::2])  # dim 2i+1
+        if self.zero_pad:
+            position_enc[0, :] = np.zeros(num_units)
+        self.lookup_table = self.add_weight("lookup_table", (T, num_units),
+                                            initializer=Constant(position_enc),
+                                            trainable=self.pos_embedding_trainable)
 
-    Returns:
+        # Be sure to call this somewhere!
+        super(PositionEncoding, self).build(input_shape)
 
-      - A 'Tensor' with one more rank than inputs's, with the dimensionality should be 'num_units'
-    '''
+    def call(self, inputs, mask=None):
+        _, T, num_units = inputs.get_shape().as_list()
+        position_ind = tf.expand_dims(tf.range(T), 0)
+        outputs = tf.nn.embedding_lookup(self.lookup_table, position_ind)
+        if self.scale:
+            outputs = outputs * num_units ** 0.5
+        return outputs + inputs
 
-    _, T, num_units = inputs.get_shape().as_list()
-    # with tf.variable_scope(scope, reuse=reuse):
-    position_ind = tf.expand_dims(tf.range(T), 0)
-    # First part of the PE function: sin and cos argument
-    position_enc = np.array([
-        [pos / np.power(10000, 2. * i / num_units)
-         for i in range(num_units)]
-        for pos in range(T)])
+    def compute_output_shape(self, input_shape):
 
-    # Second part, apply the cosine to even columns and sin to odds.
-    position_enc[:, 0::2] = np.sin(position_enc[:, 0::2])  # dim 2i
-    position_enc[:, 1::2] = np.cos(position_enc[:, 1::2])  # dim 2i+1
+        return input_shape
 
-    # Convert to a tensor
+    def compute_mask(self, inputs, mask=None):
+        return mask
 
-    if pos_embedding_trainable:
-        lookup_table = K.variable(position_enc, dtype=tf.float32)
+    def get_config(self, ):
 
-    if zero_pad:
-        lookup_table = tf.concat((tf.zeros(shape=[1, num_units]),
-                                  lookup_table[1:, :]), 0)
-
-    outputs = tf.nn.embedding_lookup(lookup_table, position_ind)
-
-    if scale:
-        outputs = outputs * num_units ** 0.5
-    return outputs + inputs
+        config = {'pos_embedding_trainable': self.pos_embedding_trainable, 'zero_pad': self.zero_pad,
+                  'scale': self.scale}
+        base_config = super(PositionEncoding, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
 
 class BiasEncoding(Layer):
@@ -683,8 +706,12 @@ class BiasEncoding(Layer):
             embed_size = input_shape[2].value
             seq_len_max = input_shape[1].value
         else:
-            embed_size = input_shape[0][2].value
-            seq_len_max = input_shape[0][1].value
+            try:
+                embed_size = input_shape[0][2].value
+                seq_len_max = input_shape[0][1].value
+            except AttributeError:
+                embed_size = input_shape[0][2]
+                seq_len_max = input_shape[0][1]
 
         self.sess_bias_embedding = self.add_weight('sess_bias_embedding', shape=(self.sess_max_count, 1, 1),
                                                    initializer=TruncatedNormal(
@@ -743,8 +770,8 @@ class DynamicGRU(Layer):
             self.gru_cell = VecAttGRUCell(self.num_units)
         else:
             try:
-                self.gru_cell = tf.nn.rnn_cell.GRUCell(self.num_units)
-            except:
+                self.gru_cell = tf.nn.rnn_cell.GRUCell(self.num_units)  # GRUCell
+            except AttributeError:
                 self.gru_cell = tf.compat.v1.nn.rnn_cell.GRUCell(self.num_units)
 
         # Be sure to call this somewhere!

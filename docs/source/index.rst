@@ -42,18 +42,20 @@ You can read the latest code and related projects
 
 News
 -----
-03/13/2021 : Add `BST <./Features.html#bst-behavior-sequence-transformer>`_ . `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.8.5>`_
+11/10/2022 : Add `EDCN` . `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.9.3>`_
 
-02/12/2021 : Fix bug in DCN-Mix. `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.8.4>`_
+10/15/2022 : Support python `3.9` , `3.10` . `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.9.2>`_
 
-01/06/2021 : Add `DCN-Mix <./Features.html#dcn-mix-improved-deep-cross-network-with-mix-of-experts-and-matrix-kernel>`_ (`中文介绍 <https://mp.weixin.qq.com/s/0qidwbxyfTkODTw2DIiRWw>`_) and support ``transform_fn`` in ``DenseFeat``. `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.8.3>`_
+06/11/2022 : Improve compatibility with tensorflow `2.x`. `Changelog <https://github.com/shenweichen/DeepCTR/releases/tag/v0.9.1>`_
 
 DisscussionGroup
 -----------------------
 
-`Discussions <https://github.com/shenweichen/DeepCTR/discussions>`_  公众号：**浅梦的学习笔记**  wechat ID: **deepctrbot**
+  公众号：**浅梦学习笔记**  wechat ID: **deepctrbot**
 
-.. image:: ../pics/code.png
+  `Discussions <https://github.com/shenweichen/DeepCTR/discussions>`_ `学习小组主题集合 <https://mp.weixin.qq.com/mp/appmsgalbum?__biz=MjM5MzY4NzE3MA==&action=getalbum&album_id=1361647041096843265&scene=126#wechat_redirect>`_
+
+.. image:: ../pics/code2.jpg
 
 .. toctree::
    :maxdepth: 2
